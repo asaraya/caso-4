@@ -25,7 +25,6 @@ import redis.clients.jedis.Jedis;
 public class UsuarioControllerCache {
 
     private static HikariDataSource dataSource;
-    private static Jedis jedis;
     private static ObjectMapper objectMapper = new ObjectMapper();
 
     static {
@@ -36,8 +35,6 @@ public class UsuarioControllerCache {
         config.setDriverClassName("com.microsoft.sqlserver.jdbc.SQLServerDriver");
         config.setMaximumPoolSize(10);
         dataSource = new HikariDataSource(config);
-
-        jedis = new Jedis("localhost", 6379);
     }
 
     @RequestMapping(value = "Get35WithCache", method = RequestMethod.GET)
@@ -45,43 +42,48 @@ public class UsuarioControllerCache {
         List<Usuario> response = new ArrayList<>();
         Usuario usuario = new Usuario();
 
-        if (jedis.exists(cacheKey)) {
-            String cachedResponse = jedis.get(cacheKey);
+        try (Jedis jedis = new Jedis("localhost", 6379)) {
+            if (jedis.exists(cacheKey)) {
+                String cachedResponse = jedis.get(cacheKey);
+                try {
+                    response = objectMapper.readValue(cachedResponse, objectMapper.getTypeFactory().constructCollectionType(List.class, Usuario.class));
+                    return new ResponseEntity<>(response, HttpStatus.OK);
+                } catch (JsonProcessingException e) {
+                    return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+                }
+            }
+
             try {
-                response = objectMapper.readValue(cachedResponse, objectMapper.getTypeFactory().constructCollectionType(List.class, Usuario.class));
-                return new ResponseEntity<>(response, HttpStatus.OK);
-            } catch (JsonProcessingException e) {
-                return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
-            }
-        }
+                Connection connection = dataSource.getConnection();
+                Statement statement = connection.createStatement();
+                String SQL = "WITH UserSubset AS ( " +
+                             "SELECT *, ROW_NUMBER() OVER (ORDER BY id) AS RowNum FROM Users ) " +
+                             "SELECT * FROM UserSubset WHERE RowNum <= (SELECT CAST(COUNT(*) * 0.35 AS INT) FROM Users)";
+                ResultSet result = statement.executeQuery(SQL);
 
-        try {
-            Connection connection = dataSource.getConnection();
-            Statement statement = connection.createStatement();
-            String SQL = "WITH UserSubset AS ( " +
-                         "SELECT *, ROW_NUMBER() OVER (ORDER BY id) AS RowNum FROM Users ) " +
-                         "SELECT * FROM UserSubset WHERE RowNum <= (SELECT CAST(COUNT(*) * 0.35 AS INT) FROM Users)";
-            ResultSet result = statement.executeQuery(SQL);
+                while (result.next()) {
+                    usuario = new Usuario();
+                    usuario.setId(result.getInt("id"));
+                    usuario.setNombre(result.getString("nombre"));
+                    usuario.setCorreo(result.getString("correo"));
+                    usuario.setTelefono(result.getString("telefono"));
+                    response.add(usuario);
+                }
+                connection.close();
 
-            while (result.next()) {
-                usuario = new Usuario();
-                usuario.setId(result.getInt("id"));
-                usuario.setNombre(result.getString("nombre"));
-                usuario.setCorreo(result.getString("correo"));
-                usuario.setTelefono(result.getString("telefono"));
+                String jsonResponse = objectMapper.writeValueAsString(response);
+                jedis.set(cacheKey, jsonResponse);
+
+            } catch (SQLException | JsonProcessingException e) {
+                usuario.setNombre(e.toString());
                 response.add(usuario);
+                return new ResponseEntity<List<Usuario>>(response, HttpStatus.INTERNAL_SERVER_ERROR);
             }
-            connection.close();
 
-            String jsonResponse = objectMapper.writeValueAsString(response);
-            jedis.set(cacheKey, jsonResponse);
-
-        } catch (SQLException | JsonProcessingException e) {
-            usuario.setNombre(e.toString());
-            response.add(usuario);
-            return new ResponseEntity<List<Usuario>>(response, HttpStatus.INTERNAL_SERVER_ERROR);
+        } catch (Exception e) {
+            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
         }
 
-        return new ResponseEntity<List<Usuario>>(response, HttpStatus.OK);
+        return new ResponseEntity<>(response, HttpStatus.OK);
     }
 }
